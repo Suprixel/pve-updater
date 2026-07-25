@@ -1,0 +1,496 @@
+#!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# pve-updater - one command that updates a whole Proxmox node
+#
+#   1. the PVE host itself           (apt-get update && dist-upgrade)
+#   2. every LXC container           (apt / apk / dnf / pacman / zypper)
+#   3. every docker compose stack    (pull + up -d), discovered automatically
+#
+# Writes a JSON report and a full log per run, both served by the dashboard.
+# ---------------------------------------------------------------------------
+set -uo pipefail
+
+VERSION=1.2.1
+
+# ------------------------------- defaults ----------------------------------
+CONF_FILE=${PVE_UPDATER_CONF:-/etc/pve-updater/pve-updater.conf}
+AGENT=/usr/local/lib/pve-updater/agent.sh
+STATE_DIR=/var/lib/pve-updater
+WEB_DIR=$STATE_DIR/web
+LOG_DIR=/var/log/pve-updater
+
+UPDATE_HOST=true
+UPDATE_GUESTS=true
+UPDATE_PACKAGES=true
+UPDATE_DOCKER=true
+EXCLUDE_CTIDS=()
+ONLY_CTIDS=()
+INCLUDE_STOPPED=false
+POST_START_WAIT=15
+SNAPSHOT_BEFORE_UPDATE=false
+SNAPSHOT_KEEP=2
+DOCKER_PRUNE=true
+DOCKER_PRUNE_ALL=false
+DISCOVER_COMPOSE_FILES=true
+ADOPT_ORPHAN_STACKS=false
+REPORT_RETENTION=40
+REBOOT_HOST_IF_REQUIRED=false
+NTFY_URL=""
+NTFY_TOKEN=""
+WEBHOOK_URL=""
+
+DRY_RUN=false
+INVENTORY_ONLY=false
+
+# shellcheck disable=SC1090
+[[ -r $CONF_FILE ]] && source "$CONF_FILE"
+
+REPORT_DIR=$WEB_DIR/reports
+WEB_LOG_DIR=$WEB_DIR/logs
+
+# ------------------------------- cli ---------------------------------------
+usage() {
+    cat <<EOF
+pve-updater $VERSION
+
+Usage: pve-updater [options]
+
+  --dry-run          Report what would change without changing anything
+  --inventory        Discover services only. No updates at all. Fast.
+  --host-only        Update the PVE host and nothing else
+  --guests-only      Skip the PVE host
+  --only 100,102     Restrict to these container IDs
+  --exclude 110,111  Additionally skip these container IDs
+  --no-docker        Skip compose stacks, OS packages only
+  --no-packages      Skip OS packages, compose stacks only
+  --snapshot         Take a pre-update snapshot of every container
+  --config FILE      Use an alternate config file
+  --help, --version
+
+Config file: $CONF_FILE
+Reports:     $REPORT_DIR
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run)     DRY_RUN=true ;;
+        --inventory)   INVENTORY_ONLY=true; DRY_RUN=true ;;
+        --host-only)   UPDATE_GUESTS=false ;;
+        --guests-only) UPDATE_HOST=false ;;
+        --only)        IFS=', ' read -r -a ONLY_CTIDS <<<"$2"; shift ;;
+        --exclude)     IFS=', ' read -r -a _ex <<<"$2"; EXCLUDE_CTIDS+=("${_ex[@]}"); shift ;;
+        --no-docker)   UPDATE_DOCKER=false ;;
+        --no-packages) UPDATE_PACKAGES=false ;;
+        --snapshot)    SNAPSHOT_BEFORE_UPDATE=true ;;
+        --config)      CONF_FILE="$2"; shift ;;
+        --help|-h)     usage; exit 0 ;;
+        --version|-V)  echo "$VERSION"; exit 0 ;;
+        *)             echo "unknown option: $1" >&2; usage >&2; exit 64 ;;
+    esac
+    shift
+done
+
+$INVENTORY_ONLY && { UPDATE_PACKAGES=false; UPDATE_DOCKER=true; }
+
+# ------------------------------- prerequisites -----------------------------
+for bin in jq pct pvesh; do
+    command -v "$bin" >/dev/null 2>&1 || {
+        echo "pve-updater: required command '$bin' not found" >&2
+        [[ $bin == jq ]] && echo "install it with: apt-get install -y jq" >&2
+        exit 70
+    }
+done
+[[ -r $AGENT ]] || { echo "pve-updater: agent not found at $AGENT" >&2; exit 70; }
+[[ $EUID -eq 0 ]] || { echo "pve-updater: must run as root" >&2; exit 77; }
+
+mkdir -p "$REPORT_DIR" "$WEB_LOG_DIR" "$LOG_DIR"
+
+# ------------------------------- run context -------------------------------
+NODE=$(hostname -s)
+RUN_ID=$(date +%Y%m%d-%H%M%S)
+STARTED_EPOCH=$(date +%s)
+STARTED_ISO=$(date -Is)
+LOGFILE=$LOG_DIR/$RUN_ID.log
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+exec 9>/var/lock/pve-updater.lock
+if ! flock -n 9; then
+    echo "pve-updater: another run is already in progress" >&2
+    exit 75
+fi
+
+log() { printf '%s  %s\n' "$(date '+%H:%M:%S')" "$*" | tee -a "$LOGFILE"; }
+logfile_only() { cat >>"$LOGFILE"; }
+
+log "pve-updater $VERSION starting on node $NODE (run $RUN_ID)"
+log "config: $CONF_FILE  exclude=[${EXCLUDE_CTIDS[*]:-none}]  snapshot=$SNAPSHOT_BEFORE_UPDATE"
+$DRY_RUN && log "DRY RUN - nothing will be modified"
+
+AGENT_ARGS=()
+$UPDATE_PACKAGES        || AGENT_ARGS+=(--no-packages)
+$UPDATE_DOCKER          || AGENT_ARGS+=(--no-docker)
+$DOCKER_PRUNE           && AGENT_ARGS+=(--prune)
+$DOCKER_PRUNE_ALL       && AGENT_ARGS+=(--prune-all)
+$DISCOVER_COMPOSE_FILES || AGENT_ARGS+=(--no-discover)
+$ADOPT_ORPHAN_STACKS    && AGENT_ARGS+=(--adopt-orphans)
+$DRY_RUN                && AGENT_ARGS+=(--dry-run)
+
+# ------------------------------- target state ------------------------------
+TARGETS_JSON='[]'
+TOT_PKGS=0
+TOT_IMAGES=0
+TOT_STACKS=0
+TOT_ERRORS=0
+TOT_WARNINGS=0
+
+reset_target() {
+    T_OS=unknown; T_KERNEL=""; T_PKG_MGR=none; T_PKG_STATUS=skipped; T_PKGS=0
+    T_REBOOT=false; T_DOCKER=false; T_DC=none; T_DISK=""; T_RECLAIMED=""
+    T_STACKS='[]'; T_IMAGES='[]'; T_CONTAINERS='[]'; T_ORPHANS='[]'; T_PKGLIST='[]'
+    T_DONE=false; T_SNAPSHOT=""; T_NOTE=""
+}
+
+num() { [[ $1 =~ ^[0-9]+$ ]] && echo "$1" || echo 0; }
+
+parse_agent_output() {
+    local f=$1 line p file total upd st note img updated name image state ports proj
+    while IFS= read -r line; do
+        case "$line" in
+            OS_NAME=*)         T_OS=${line#*=} ;;
+            KERNEL=*)          T_KERNEL=${line#*=} ;;
+            PKG_MGR=*)         T_PKG_MGR=${line#*=} ;;
+            PKG_STATUS=*)      T_PKG_STATUS=${line#*=} ;;
+            PKG_NOTE=*)        T_NOTE=${line#*=} ;;
+            PKGS_UPGRADED=*)   T_PKGS=$(num "${line#*=}") ;;
+            REBOOT_REQUIRED=*) T_REBOOT=true ;;
+            DISK_USED_PCT=*)   T_DISK=${line#*=} ;;
+            RECLAIMED=*)       T_RECLAIMED=${line#*=} ;;
+            DOCKER=1)          T_DOCKER=true ;;
+            DOCKER_COMPOSE=*)  T_DC=${line#*=} ;;
+            AGENT_DONE=1)      T_DONE=true ;;
+            STACK\|*)
+                IFS='|' read -r _ p file total upd st note <<<"$line"
+                T_STACKS=$(jq -c \
+                    --arg p "$p" --arg f "$file" --arg s "${st:-ok}" --arg n "${note:-}" \
+                    --argjson t "$(num "${total:-0}")" --argjson u "$(num "${upd:-0}")" \
+                    '. + [{project:$p, file:$f, images:$t, updated:$u, status:$s, note:$n}]' \
+                    <<<"$T_STACKS")
+                ;;
+            IMAGE\|*)
+                IFS='|' read -r _ p img updated <<<"$line"
+                T_IMAGES=$(jq -c --arg p "$p" --arg i "$img" \
+                    --argjson u "$(num "${updated:-0}")" \
+                    '. + [{project:$p, image:$i, updated:($u==1)}]' <<<"$T_IMAGES")
+                ;;
+            CONTAINER\|*)
+                IFS='|' read -r _ name image state ports proj <<<"$line"
+                T_CONTAINERS=$(jq -c --arg n "$name" --arg i "$image" \
+                    --arg s "${state:-}" --arg po "${ports:-}" --arg pr "${proj:-}" \
+                    '. + [{name:$n, image:$i, state:$s, ports:$po, project:$pr}]' \
+                    <<<"$T_CONTAINERS")
+                ;;
+            ORPHAN\|*)
+                T_ORPHANS=$(jq -c --arg f "${line#ORPHAN|}" '. + [$f]' <<<"$T_ORPHANS")
+                ;;
+        esac
+    done <"$f"
+
+    if grep -q '^PKG|' "$f"; then
+        T_PKGLIST=$(grep '^PKG|' "$f" | head -500 \
+            | jq -Rc -n '[inputs | split("|") | {name:.[1], from:.[2], to:.[3]}]')
+    fi
+}
+
+target_status() {
+    local st=ok
+    [[ $T_PKG_STATUS == error ]] && st=error
+    $T_DONE || st=error
+    if [[ $st != error ]]; then
+        jq -e 'any(.[]; .status=="error")' <<<"$T_STACKS" >/dev/null 2>&1 && st=error
+    fi
+    if [[ $st == ok ]]; then
+        [[ $T_PKG_STATUS == warn ]] && st=warn
+        jq -e 'any(.[]; .status=="warn")' <<<"$T_STACKS" >/dev/null 2>&1 && st=warn
+        $T_REBOOT && st=warn
+    fi
+    echo "$st"
+}
+
+commit_target() {
+    local id=$1 type=$2 name=$3 status=$4 skipped=${5:-false}
+    local stacks_n images_n
+    stacks_n=$(jq 'length' <<<"$T_STACKS")
+    images_n=$(jq '[.[] | select(.updated)] | length' <<<"$T_IMAGES")
+
+    TARGETS_JSON=$(jq -c \
+        --arg id "$id" --arg type "$type" --arg name "$name" --arg status "$status" \
+        --arg os "$T_OS" --arg kernel "$T_KERNEL" --arg pkgmgr "$T_PKG_MGR" \
+        --arg pkgstatus "$T_PKG_STATUS" --arg disk "$T_DISK" \
+        --arg reclaimed "$T_RECLAIMED" --arg snapshot "$T_SNAPSHOT" \
+        --arg dc "$T_DC" --arg note "$T_NOTE" \
+        --argjson pkgs "$(num "$T_PKGS")" \
+        --argjson pkglist "$T_PKGLIST" \
+        --argjson reboot "$T_REBOOT" --argjson docker "$T_DOCKER" \
+        --argjson skipped "$skipped" \
+        --argjson stacks "$T_STACKS" --argjson images "$T_IMAGES" \
+        --argjson containers "$T_CONTAINERS" --argjson orphans "$T_ORPHANS" \
+        --argjson images_updated "$images_n" \
+        '. + [{
+            id:$id, type:$type, name:$name, status:$status, skipped:$skipped,
+            os:$os, kernel:$kernel, disk_used_pct:$disk, note:$note,
+            packages:{manager:$pkgmgr, status:$pkgstatus, upgraded:$pkgs, list:$pkglist},
+            reboot_required:$reboot, snapshot:$snapshot,
+            docker:{present:$docker, compose:$dc, reclaimed:$reclaimed,
+                    images_updated:$images_updated},
+            stacks:$stacks, images:$images, containers:$containers, orphans:$orphans
+        }]' <<<"$TARGETS_JSON")
+
+    TOT_PKGS=$(( TOT_PKGS + $(num "$T_PKGS") ))
+    TOT_IMAGES=$(( TOT_IMAGES + images_n ))
+    TOT_STACKS=$(( TOT_STACKS + stacks_n ))
+    [[ $status == error ]] && TOT_ERRORS=$(( TOT_ERRORS + 1 ))
+    [[ $status == warn  ]] && TOT_WARNINGS=$(( TOT_WARNINGS + 1 ))
+    return 0
+}
+
+# ------------------------------- the PVE host ------------------------------
+update_host() {
+    log ""
+    log "=== host: $NODE ==="
+    reset_target
+    local out=$TMPDIR/host.out err=$TMPDIR/host.err
+    sh "$AGENT" "${AGENT_ARGS[@]}" >"$out" 2>"$err"
+    cat "$err" >>"$LOGFILE"
+    parse_agent_output "$out"
+    local st
+    st=$(target_status)
+    log "host: $T_PKGS package(s) upgraded, status $st"
+    $T_REBOOT && log "host: a reboot is required (kernel or libc updated)"
+    commit_target host host "$NODE" "$st"
+
+    if $T_REBOOT && $REBOOT_HOST_IF_REQUIRED && ! $DRY_RUN; then
+        log "host: REBOOT_HOST_IF_REQUIRED is set, rebooting in 60s"
+        shutdown -r +1 "pve-updater: scheduled reboot after updates" | logfile_only
+    fi
+}
+
+# ------------------------------- guests ------------------------------------
+list_guests() {
+    local json
+    json=$(pvesh get "/nodes/$NODE/lxc" --output-format json 2>/dev/null)
+    if [[ -n $json ]] && jq -e 'type=="array"' <<<"$json" >/dev/null 2>&1; then
+        jq -r '.[] | select((.template // 0 | tostring) != "1")
+               | "\(.vmid)|\(.name // "ct-\(.vmid)")|\(.status)"' <<<"$json" \
+            | sort -t'|' -k1,1n
+        return
+    fi
+    # fallback if pvesh output changes shape
+    pct list 2>/dev/null | awk 'NR>1 && $1 ~ /^[0-9]+$/ {print $1"|"$NF"|"$2}' | sort -t'|' -k1,1n
+}
+
+in_list() {
+    local needle=$1; shift
+    local x
+    for x in "$@"; do [[ $x == "$needle" ]] && return 0; done
+    return 1
+}
+
+wait_for_running() {
+    local id=$1 i
+    for i in $(seq 1 30); do
+        [[ $(pct status "$id" 2>/dev/null) == "status: running" ]] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+snapshot_ct() {
+    local id=$1 snap
+    snap="preupd$(date +%Y%m%d%H%M)"
+    if pct snapshot "$id" "$snap" --description "pve-updater pre-update snapshot" >>"$LOGFILE" 2>&1 </dev/null; then
+        T_SNAPSHOT=$snap
+        log "  snapshot $snap created"
+        # keep only the newest $SNAPSHOT_KEEP automatic snapshots
+        local old
+        old=$(pct listsnapshot "$id" 2>/dev/null \
+              | sed -n 's/.*\(preupd[0-9]\{12\}\).*/\1/p' | sort -u | head -n -"$SNAPSHOT_KEEP")
+        for s in $old; do
+            log "  removing old snapshot $s"
+            pct delsnapshot "$id" "$s" >>"$LOGFILE" 2>&1
+        done
+    else
+        log "  snapshot failed (storage may not support it, or bind mounts are present)"
+        T_NOTE="snapshot failed"
+    fi
+}
+
+update_guest() {
+    local id=$1 name=$2 state=$3
+    local started_stopped=false
+
+    log ""
+    log "=== ct $id ($name) ==="
+    reset_target
+
+    if [[ $state != running ]]; then
+        if $INCLUDE_STOPPED && ! $DRY_RUN; then
+            log "  container is stopped, starting it for the update window"
+            pct start "$id" >>"$LOGFILE" 2>&1 </dev/null
+            if ! wait_for_running "$id"; then
+                log "  could not start, skipping"
+                T_NOTE="stopped, failed to start"
+                commit_target "$id" lxc "$name" error true
+                return
+            fi
+            started_stopped=true
+            sleep "$POST_START_WAIT"
+        else
+            log "  container is stopped, skipped"
+            T_NOTE="stopped"
+            commit_target "$id" lxc "$name" skipped true
+            return
+        fi
+    fi
+
+    if $SNAPSHOT_BEFORE_UPDATE && ! $DRY_RUN; then
+        snapshot_ct "$id"
+    fi
+
+    local out=$TMPDIR/ct-$id.out err=$TMPDIR/ct-$id.err
+    local remote=/tmp/.pve-updater-agent.sh
+
+    if ! pct push "$id" "$AGENT" "$remote" --perms 0755 >>"$LOGFILE" 2>&1 </dev/null; then
+        log "  could not copy the agent into the container"
+        T_NOTE="pct push failed"
+        commit_target "$id" lxc "$name" error
+        return
+    fi
+
+    pct exec "$id" -- sh "$remote" "${AGENT_ARGS[@]}" >"$out" 2>"$err" </dev/null
+    cat "$err" >>"$LOGFILE"
+    pct exec "$id" -- rm -f "$remote" >/dev/null 2>&1 </dev/null
+    parse_agent_output "$out"
+
+    local st
+    st=$(target_status)
+    local nstacks nimages
+    nstacks=$(jq 'length' <<<"$T_STACKS")
+    nimages=$(jq '[.[] | select(.updated)] | length' <<<"$T_IMAGES")
+    log "  $T_PKGS package(s) upgraded, $nstacks stack(s), $nimages image(s) pulled, status $st"
+
+    commit_target "$id" lxc "$name" "$st"
+
+    if $started_stopped; then
+        log "  returning the container to its previous stopped state"
+        pct shutdown "$id" --timeout 120 >>"$LOGFILE" 2>&1 </dev/null \
+            || pct stop "$id" >>"$LOGFILE" 2>&1 </dev/null
+    fi
+}
+
+# ------------------------------- main --------------------------------------
+$UPDATE_HOST && update_host
+
+if $UPDATE_GUESTS; then
+    while IFS='|' read -r id name state; do
+        [[ -z $id ]] && continue
+        if [[ ${#ONLY_CTIDS[@]} -gt 0 ]] && ! in_list "$id" "${ONLY_CTIDS[@]}"; then
+            continue
+        fi
+        if [[ ${#EXCLUDE_CTIDS[@]} -gt 0 ]] && in_list "$id" "${EXCLUDE_CTIDS[@]}"; then
+            log ""
+            log "=== ct $id ($name) === excluded by config"
+            reset_target
+            T_NOTE="excluded"
+            commit_target "$id" lxc "$name" skipped true
+            continue
+        fi
+        update_guest "$id" "$name" "$state"
+    done < <(list_guests)
+fi
+
+# ------------------------------- report ------------------------------------
+FINISHED_ISO=$(date -Is)
+DURATION=$(( $(date +%s) - STARTED_EPOCH ))
+OVERALL=ok
+(( TOT_WARNINGS > 0 )) && OVERALL=warn
+(( TOT_ERRORS   > 0 )) && OVERALL=error
+
+jq -n \
+    --arg run_id "$RUN_ID" --arg node "$NODE" \
+    --arg started "$STARTED_ISO" --arg finished "$FINISHED_ISO" \
+    --arg status "$OVERALL" --arg version "$VERSION" \
+    --arg log "logs/$RUN_ID.log" \
+    --argjson duration "$DURATION" \
+    --argjson dry_run "$DRY_RUN" \
+    --argjson totals "$(jq -n \
+        --argjson packages "$TOT_PKGS" --argjson images "$TOT_IMAGES" \
+        --argjson stacks "$TOT_STACKS" --argjson errors "$TOT_ERRORS" \
+        --argjson warnings "$TOT_WARNINGS" \
+        '{packages:$packages, images:$images, stacks:$stacks, errors:$errors, warnings:$warnings}')" \
+    --argjson targets "$TARGETS_JSON" \
+    '{run_id:$run_id, node:$node, version:$version, started:$started,
+      finished:$finished, duration:$duration, status:$status, dry_run:$dry_run,
+      log:$log, totals:$totals, targets:$targets}' \
+    >"$REPORT_DIR/$RUN_ID.json"
+
+INDEX=$WEB_DIR/reports/index.json
+ENTRY=$(jq -n \
+    --arg run_id "$RUN_ID" --arg started "$STARTED_ISO" --arg status "$OVERALL" \
+    --argjson duration "$DURATION" --argjson dry_run "$DRY_RUN" \
+    --argjson targets "$(jq 'length' <<<"$TARGETS_JSON")" \
+    --argjson packages "$TOT_PKGS" --argjson images "$TOT_IMAGES" \
+    --argjson errors "$TOT_ERRORS" --argjson warnings "$TOT_WARNINGS" \
+    '{run_id:$run_id, started:$started, status:$status, duration:$duration,
+      dry_run:$dry_run, targets:$targets, packages:$packages, images:$images,
+      errors:$errors, warnings:$warnings}')
+
+if [[ -f $INDEX ]]; then
+    jq --argjson e "$ENTRY" --argjson keep "$REPORT_RETENTION" \
+       '{generated:(now|todate), runs:(([$e] + (.runs // [])) | .[0:$keep])}' \
+       "$INDEX" >"$INDEX.tmp" 2>/dev/null && mv "$INDEX.tmp" "$INDEX"
+else
+    jq -n --argjson e "$ENTRY" '{generated:(now|todate), runs:[$e]}' >"$INDEX"
+fi
+
+# drop report and log files that fell out of the index
+KEPT=$(jq -r '.runs[].run_id' "$INDEX")
+for f in "$REPORT_DIR"/*.json; do
+    b=$(basename "$f" .json)
+    [[ $b == index ]] && continue
+    grep -qxF "$b" <<<"$KEPT" || rm -f "$f" "$WEB_LOG_DIR/$b.log"
+done
+find "$LOG_DIR" -name '*.log' -mtime +90 -delete 2>/dev/null
+
+log ""
+log "=== run $RUN_ID finished in ${DURATION}s: $OVERALL ==="
+log "packages upgraded: $TOT_PKGS   images pulled: $TOT_IMAGES   stacks: $TOT_STACKS"
+log "errors: $TOT_ERRORS   warnings: $TOT_WARNINGS"
+log "report: $REPORT_DIR/$RUN_ID.json"
+
+# ------------------------------- notify ------------------------------------
+SUMMARY="node $NODE: $TOT_PKGS packages, $TOT_IMAGES images pulled, $TOT_ERRORS errors, ${DURATION}s"
+if [[ -n $NTFY_URL ]]; then
+    prio=default; [[ $OVERALL == error ]] && prio=high
+    curl -fsS -m 20 \
+        ${NTFY_TOKEN:+-H "Authorization: Bearer $NTFY_TOKEN"} \
+        -H "Title: pve-updater $OVERALL" -H "Priority: $prio" \
+        -H "Tags: package" -d "$SUMMARY" "$NTFY_URL" >/dev/null 2>&1 \
+        || log "ntfy notification failed"
+fi
+if [[ -n $WEBHOOK_URL ]]; then
+    curl -fsS -m 20 -H 'Content-Type: application/json' \
+        -d "$(jq -n --arg t "pve-updater $OVERALL" --arg s "$SUMMARY" \
+              --arg r "$RUN_ID" '{title:$t, text:$s, run_id:$r}')" \
+        "$WEBHOOK_URL" >/dev/null 2>&1 || log "webhook notification failed"
+fi
+
+cp -f "$LOGFILE" "$WEB_LOG_DIR/$RUN_ID.log"
+chmod -R a+rX "$WEB_DIR"
+
+case "$OVERALL" in
+    ok)    exit 0 ;;
+    warn)  exit 1 ;;
+    error) exit 2 ;;
+esac

@@ -1,0 +1,46 @@
+# ---------------------------------------------------------------------------
+# Never publish anything from a live install.
+# ---------------------------------------------------------------------------
+
+# The web API access key. Root on the node.
+web.token
+*.token
+
+# A run report is a full map of the homelab: container names, image tags,
+# published ports, filesystem paths. Harmless on the LAN, an inventory to
+# anyone else.
+reports/
+logs/
+*.log
+live.log
+
+# A config that has been through a real install may hold ntfy or webhook URLs
+# and their tokens. The committed template is etc/pve-updater.conf.
+/etc/pve-updater.conf.local
+*.conf.bak
+*.conf.new
+*.conf.tmp
+
+# Credentials and keys of any kind
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+id_ed25519*
+*.p12
+*.pfx
+
+# Editor and OS noise
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Build artefacts
+*.tar.gz
+node_modules/
+__pycache__/
+*.pyc

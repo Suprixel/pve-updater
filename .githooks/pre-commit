@@ -1,0 +1,32 @@
+#!/bin/sh
+# Refuses a commit that carries anything that looks like a secret.
+# Enable once per clone:  git config core.hooksPath .githooks
+fail=0
+
+for f in $(git diff --cached --name-only --diff-filter=ACM); do
+    case "$f" in
+        *web.token|*.token|*.pem|*.key|*id_rsa*|*id_ed25519*|.env|.env.*)
+            echo "pre-commit: $f is the kind of file that should never be committed"
+            fail=1
+            continue
+            ;;
+    esac
+
+    git show ":$f" 2>/dev/null | grep -Iq . || continue   # skip binaries
+
+    if git show ":$f" | grep -qE 'BEGIN (RSA|OPENSSH|EC|DSA|PGP) PRIVATE KEY'; then
+        echo "pre-commit: $f contains a private key block"
+        fail=1
+    fi
+    if git show ":$f" | grep -qE '(ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}|xox[baprs]-[A-Za-z0-9-]{10,})'; then
+        echo "pre-commit: $f contains what looks like an API token"
+        fail=1
+    fi
+    if git show ":$f" | grep -qE '^[A-Z_]*TOKEN="[A-Za-z0-9._~+/=-]{16,}"'; then
+        echo "pre-commit: $f has a filled in TOKEN= value"
+        fail=1
+    fi
+done
+
+[ $fail -eq 0 ] || echo "pre-commit: nothing was committed. Use --no-verify only if you are certain."
+exit $fail

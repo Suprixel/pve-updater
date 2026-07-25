@@ -1,0 +1,22 @@
+[Unit]
+Description=pve-updater dashboard and control API
+After=network.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/python3 /usr/local/lib/pve-updater/server.py
+Restart=on-failure
+RestartSec=5
+
+# Deliberately NOT sandboxed. This service shells out to pct and pvesh, and
+# attaching to an unprivileged container needs to write a uid mapping and join
+# a cgroup. PrivateTmp, ProtectHome, RestrictAddressFamilies and friends all
+# break that. Updates themselves are handed to systemd-run so they get a clean
+# transient unit either way. The access key is the security boundary here.
+User=root
+
+Environment=PVE_UPDATER_BIND=0.0.0.0
+Environment=PVE_UPDATER_PORT=8099
+
+[Install]
+WantedBy=multi-user.target

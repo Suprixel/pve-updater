@@ -1,0 +1,15 @@
+[Unit]
+Description=Update the PVE node, every LXC container and every compose stack
+Documentation=file:/usr/local/share/doc/pve-updater/README.md
+After=network-online.target pve-guests.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pve-updater
+# exit 1 means "finished, but something needs your attention"
+SuccessExitStatus=1
+TimeoutStartSec=3h
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

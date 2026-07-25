@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly maintenance window for the Proxmox node and its containers
+
+[Timer]
+# Sunday 03:00 local time. Change with: systemctl edit pve-updater.timer
+OnCalendar=Sun *-*-* 03:00:00
+RandomizedDelaySec=10m
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target
