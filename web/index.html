@@ -250,6 +250,7 @@
         <button class="primary" id="runbtn">Run update</button>
         <div id="runmenu" hidden></div>
       </div>
+      <a class="ghost" href="monitor.html" target="_blank" rel="noopener">Monitor</a>
       <button class="ghost" id="keybtn">Key</button>
     </div>
   </div>
@@ -622,6 +623,7 @@ const FIELDS = [
   ['UPDATE_GUESTS', 'Update the containers', 'Walk every LXC on this node.'],
   ['UPDATE_PACKAGES', 'Update OS packages', 'Inside the containers. Turn off to only touch Docker.'],
   ['UPDATE_DOCKER', 'Update compose stacks', 'docker compose pull, then up -d.'],
+  ['BTOP_MONITOR', 'Live btop monitor', 'Installs btop + ttyd in each container and adds a Monitor tab. Unlike updates, this installs packages.'],
   ['SNAPSHOT_BEFORE_UPDATE', 'Snapshot before updating', 'Needs snapshot-capable storage and no bind mounts.'],
   ['INCLUDE_STOPPED', 'Include stopped containers', 'Start them, update them, then stop them again.'],
   ['DOCKER_PRUNE', 'Clean up old images', 'Removes dangling images after the pull.'],
@@ -634,6 +636,7 @@ const NUMS = [
   ['SNAPSHOT_KEEP', 'Snapshots kept per container'],
   ['REPORT_RETENTION', 'Runs kept in this dashboard'],
   ['POST_START_WAIT', 'Seconds to wait after starting a container'],
+  ['BTOP_PORT', 'btop monitor port (per container)'],
 ];
 const TEXTS = [
   ['NTFY_URL', 'ntfy topic URL', 'Gets a one line summary after every run.'],

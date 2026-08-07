@@ -15,6 +15,7 @@ VERSION=1.2.1
 # ------------------------------- defaults ----------------------------------
 CONF_FILE=${PVE_UPDATER_CONF:-/etc/pve-updater/pve-updater.conf}
 AGENT=/usr/local/lib/pve-updater/agent.sh
+BTOP_AGENT=/usr/local/lib/pve-updater/btop-agent.sh
 STATE_DIR=/var/lib/pve-updater
 WEB_DIR=$STATE_DIR/web
 LOG_DIR=/var/log/pve-updater
@@ -23,6 +24,8 @@ UPDATE_HOST=true
 UPDATE_GUESTS=true
 UPDATE_PACKAGES=true
 UPDATE_DOCKER=true
+BTOP_MONITOR=false
+BTOP_PORT=7681
 EXCLUDE_CTIDS=()
 ONLY_CTIDS=()
 INCLUDE_STOPPED=false
@@ -139,6 +142,7 @@ $DRY_RUN                && AGENT_ARGS+=(--dry-run)
 
 # ------------------------------- target state ------------------------------
 TARGETS_JSON='[]'
+MONITOR_JSON='[]'
 TOT_PKGS=0
 TOT_IMAGES=0
 TOT_STACKS=0
@@ -276,6 +280,26 @@ update_host() {
     fi
 }
 
+# ------------------------------- btop monitor ------------------------------
+monitor_provision() {
+    local id=$1 name=$2 ip
+    if ! $DRY_RUN; then
+        if pct push "$id" "$BTOP_AGENT" /tmp/.pve-btop-agent.sh --perms 0755 \
+               >>"$LOGFILE" 2>&1 </dev/null; then
+            pct exec "$id" -- sh /tmp/.pve-btop-agent.sh "$BTOP_PORT" \
+                >>"$LOGFILE" 2>&1 </dev/null || log "  btop-monitor: provisioning failed"
+            pct exec "$id" -- rm -f /tmp/.pve-btop-agent.sh >/dev/null 2>&1 </dev/null
+        else
+            log "  btop-monitor: could not push agent"
+        fi
+    fi
+    ip=$(pct exec "$id" -- sh -c 'hostname -I 2>/dev/null' </dev/null | awk '{print $1}')
+    [[ -z $ip ]] && ip=$(pct exec "$id" -- sh -c 'ip -4 -o addr show 2>/dev/null' </dev/null \
+        | awk '$2!="lo" && $3=="inet"{split($4,a,"/"); print a[1]; exit}')
+    [[ -n $ip ]] && MONITOR_JSON=$(jq -c --arg id "$id" --arg name "$name" --arg ip "$ip" \
+        '. + [{id:($id|tonumber), name:$name, ip:$ip}]' <<<"$MONITOR_JSON")
+}
+
 # ------------------------------- guests ------------------------------------
 list_guests() {
     local json
@@ -382,6 +406,10 @@ update_guest() {
 
     commit_target "$id" lxc "$name" "$st"
 
+    if $BTOP_MONITOR && ! $started_stopped; then
+        monitor_provision "$id" "$name"
+    fi
+
     if $started_stopped; then
         log "  returning the container to its previous stopped state"
         pct shutdown "$id" --timeout 120 >>"$LOGFILE" 2>&1 </dev/null \
@@ -484,6 +512,14 @@ if [[ -n $WEBHOOK_URL ]]; then
         -d "$(jq -n --arg t "pve-updater $OVERALL" --arg s "$SUMMARY" \
               --arg r "$RUN_ID" '{title:$t, text:$s, run_id:$r}')" \
         "$WEBHOOK_URL" >/dev/null 2>&1 || log "webhook notification failed"
+fi
+
+if $BTOP_MONITOR; then
+    jq -n --argjson port "$(num "$BTOP_PORT")" --arg gen "$(date -Is)" \
+          --argjson cts "$MONITOR_JSON" \
+          '{ttyd_port:$port, generated:$gen, containers:$cts}' \
+          >"$WEB_DIR/containers.json" 2>/dev/null \
+        && log "btop-monitor: $(jq 'length' <<<"$MONITOR_JSON") host(s) in containers.json"
 fi
 
 cp -f "$LOGFILE" "$WEB_LOG_DIR/$RUN_ID.log"
