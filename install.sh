@@ -19,13 +19,19 @@ install -d /usr/local/lib/pve-updater /etc/pve-updater \
            /var/lib/pve-updater/web/reports /var/lib/pve-updater/web/logs \
            /var/log/pve-updater /usr/local/share/doc/pve-updater
 
-install -m 0755 "$SRC/bin/pve-updater"  /usr/local/bin/pve-updater
-install -m 0755 "$SRC/lib/agent.sh"     /usr/local/lib/pve-updater/agent.sh
+install -m 0755 "$SRC/bin/pve-updater"   /usr/local/bin/pve-updater
+install -m 0755 "$SRC/lib/agent.sh"      /usr/local/lib/pve-updater/agent.sh
 install -m 0755 "$SRC/lib/btop-agent.sh" /usr/local/lib/pve-updater/btop-agent.sh
-install -m 0644 "$SRC/web/index.html"   /var/lib/pve-updater/web/index.html
-install -m 0644 "$SRC/web/monitor.html" /var/lib/pve-updater/web/monitor.html
-install -m 0755 "$SRC/web/server.py"    /usr/local/lib/pve-updater/server.py
-install -m 0644 "$SRC/README.md"        /usr/local/share/doc/pve-updater/README.md
+install -m 0755 "$SRC/web/server.py"     /usr/local/lib/pve-updater/server.py
+install -m 0644 "$SRC/README.md"         /usr/local/share/doc/pve-updater/README.md
+
+# every static asset in web/ except the backend. Adding a page, a stylesheet or
+# a script needs no change here.
+for f in "$SRC"/web/*; do
+    [[ -f $f ]] || continue
+    [[ $(basename "$f") == *.py ]] && continue
+    install -m 0644 "$f" /var/lib/pve-updater/web/
+done
 
 if [[ -f /etc/pve-updater/pve-updater.conf ]]; then
     install -m 0644 "$SRC/etc/pve-updater.conf" /etc/pve-updater/pve-updater.conf.new

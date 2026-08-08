@@ -63,6 +63,16 @@ SCHEMA = {
     "BTOP_MONITOR": BOOL, "BTOP_PORT": INT,
 }
 
+# mode -> extra CLI flags. "monitor" always needs "only" to be meaningful,
+# but is not rejected without it: an unrestricted --monitor-only just walks
+# every running guest, which is a legitimate "fix them all" action too.
+RUN_MODES = {
+    "full": [],
+    "dry": ["--dry-run"],
+    "inventory": ["--inventory"],
+    "monitor": ["--monitor-only"],
+}
+
 _run_lock = threading.Lock()
 _run = {"proc": None, "mode": None, "started": None, "exit": None, "unit": None}
 
@@ -254,13 +264,10 @@ def start_run(mode, only):
         if p and p.poll() is None:
             raise RuntimeError("a run is already going")
 
-        args = [BIN]
-        if mode == "dry":
-            args.append("--dry-run")
-        elif mode == "inventory":
-            args.append("--inventory")
-        elif mode != "full":
+        if mode not in RUN_MODES:
             raise ValueError("unknown mode")
+
+        args = [BIN] + RUN_MODES[mode]
         if only:
             args += ["--only", ",".join(str(int(x)) for x in only)]
 

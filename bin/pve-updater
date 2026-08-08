@@ -10,7 +10,7 @@
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
-VERSION=1.2.1
+VERSION=1.4.4
 
 # ------------------------------- defaults ----------------------------------
 CONF_FILE=${PVE_UPDATER_CONF:-/etc/pve-updater/pve-updater.conf}
@@ -44,6 +44,7 @@ WEBHOOK_URL=""
 
 DRY_RUN=false
 INVENTORY_ONLY=false
+MONITOR_ONLY=false
 
 # shellcheck disable=SC1090
 [[ -r $CONF_FILE ]] && source "$CONF_FILE"
@@ -58,16 +59,19 @@ pve-updater $VERSION
 
 Usage: pve-updater [options]
 
-  --dry-run          Report what would change without changing anything
-  --inventory        Discover services only. No updates at all. Fast.
-  --host-only        Update the PVE host and nothing else
-  --guests-only      Skip the PVE host
-  --only 100,102     Restrict to these container IDs
-  --exclude 110,111  Additionally skip these container IDs
-  --no-docker        Skip compose stacks, OS packages only
-  --no-packages      Skip OS packages, compose stacks only
-  --snapshot         Take a pre-update snapshot of every container
-  --config FILE      Use an alternate config file
+  --dry-run           Report what would change without changing anything
+  --inventory         Discover services only. No updates at all. Fast.
+  --monitor-only       Install/refresh btop+ttyd only. No packages, no docker.
+                        Ignores BTOP_MONITOR and always provisions the target.
+                        Meant to be paired with --only.
+  --host-only         Update the PVE host and nothing else
+  --guests-only       Skip the PVE host
+  --only 100,102      Restrict to these container IDs
+  --exclude 110,111   Additionally skip these container IDs
+  --no-docker         Skip compose stacks, OS packages only
+  --no-packages       Skip OS packages, compose stacks only
+  --snapshot          Take a pre-update snapshot of every container
+  --config FILE       Use an alternate config file
   --help, --version
 
 Config file: $CONF_FILE
@@ -77,19 +81,22 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry-run)     DRY_RUN=true ;;
-        --inventory)   INVENTORY_ONLY=true; DRY_RUN=true ;;
-        --host-only)   UPDATE_GUESTS=false ;;
-        --guests-only) UPDATE_HOST=false ;;
-        --only)        IFS=', ' read -r -a ONLY_CTIDS <<<"$2"; shift ;;
-        --exclude)     IFS=', ' read -r -a _ex <<<"$2"; EXCLUDE_CTIDS+=("${_ex[@]}"); shift ;;
-        --no-docker)   UPDATE_DOCKER=false ;;
-        --no-packages) UPDATE_PACKAGES=false ;;
-        --snapshot)    SNAPSHOT_BEFORE_UPDATE=true ;;
-        --config)      CONF_FILE="$2"; shift ;;
-        --help|-h)     usage; exit 0 ;;
-        --version|-V)  echo "$VERSION"; exit 0 ;;
-        *)             echo "unknown option: $1" >&2; usage >&2; exit 64 ;;
+        --dry-run)      DRY_RUN=true ;;
+        --inventory)    INVENTORY_ONLY=true; DRY_RUN=true ;;
+        --monitor-only) MONITOR_ONLY=true; UPDATE_HOST=false
+                        UPDATE_PACKAGES=false; UPDATE_DOCKER=false
+                        BTOP_MONITOR=true ;;
+        --host-only)    UPDATE_GUESTS=false ;;
+        --guests-only)  UPDATE_HOST=false ;;
+        --only)         IFS=', ' read -r -a ONLY_CTIDS <<<"$2"; shift ;;
+        --exclude)      IFS=', ' read -r -a _ex <<<"$2"; EXCLUDE_CTIDS+=("${_ex[@]}"); shift ;;
+        --no-docker)    UPDATE_DOCKER=false ;;
+        --no-packages)  UPDATE_PACKAGES=false ;;
+        --snapshot)     SNAPSHOT_BEFORE_UPDATE=true ;;
+        --config)       CONF_FILE="$2"; shift ;;
+        --help|-h)      usage; exit 0 ;;
+        --version|-V)   echo "$VERSION"; exit 0 ;;
+        *)              echo "unknown option: $1" >&2; usage >&2; exit 64 ;;
     esac
     shift
 done
@@ -106,6 +113,10 @@ for bin in jq pct pvesh; do
 done
 [[ -r $AGENT ]] || { echo "pve-updater: agent not found at $AGENT" >&2; exit 70; }
 [[ $EUID -eq 0 ]] || { echo "pve-updater: must run as root" >&2; exit 77; }
+if $BTOP_MONITOR && [[ ! -r $BTOP_AGENT ]]; then
+    echo "pve-updater: btop agent not found at $BTOP_AGENT" >&2
+    exit 70
+fi
 
 mkdir -p "$REPORT_DIR" "$WEB_LOG_DIR" "$LOG_DIR"
 
@@ -130,6 +141,7 @@ logfile_only() { cat >>"$LOGFILE"; }
 log "pve-updater $VERSION starting on node $NODE (run $RUN_ID)"
 log "config: $CONF_FILE  exclude=[${EXCLUDE_CTIDS[*]:-none}]  snapshot=$SNAPSHOT_BEFORE_UPDATE"
 $DRY_RUN && log "DRY RUN - nothing will be modified"
+$MONITOR_ONLY && log "MONITOR ONLY - installing/refreshing btop+ttyd, nothing else touched"
 
 AGENT_ARGS=()
 $UPDATE_PACKAGES        || AGENT_ARGS+=(--no-packages)
@@ -300,6 +312,77 @@ monitor_provision() {
         '. + [{id:($id|tonumber), name:$name, ip:$ip}]' <<<"$MONITOR_JSON")
 }
 
+# Merge freshly provisioned entries into any existing containers.json instead
+# of clobbering it. A full run still writes every provisioned host, so it's
+# self-healing; a --monitor-only --only run must not blank out every other
+# container's tile.
+#
+# jq's own exit status decides the branch, not the shape of its output: an
+# empty or malformed result from a failed merge must never fall through to
+# "write only what this run touched", or a single --only run wipes every
+# other container's tile. If the existing file cannot be merged, this run's
+# entries are appended to the log as a failure and the file is left alone.
+# Merge freshly provisioned entries into any existing containers.json instead
+# of clobbering it. A full run still writes every provisioned host, so it's
+# self-healing; a --monitor-only --only run must not blank out every other
+# container's tile.
+#
+# Kept deliberately simple and checked at every step rather than one clever
+# jq one-liner: this function has already once destroyed the file it was
+# meant to protect, so it now refuses to write anything it cannot verify.
+write_monitor_json() {
+    local existing=$WEB_DIR/containers.json
+    local old_json='[]' merged errfile count_old count_new count_merged
+
+    errfile=$TMPDIR/monitor-merge.err
+    : >"$errfile"
+
+    if [[ -f $existing ]]; then
+        if ! jq -e '.containers // [] | type == "array"' "$existing" >/dev/null 2>"$errfile"; then
+            log "  btop-monitor: existing containers.json does not parse, leaving it untouched"
+            [[ -s $errfile ]] && log "  btop-monitor: jq said: $(tr '\n' ' ' <"$errfile")"
+            return 1
+        fi
+        old_json=$(jq -c '.containers // []' "$existing" 2>"$errfile") || {
+            log "  btop-monitor: could not read the existing container list, leaving it untouched"
+            return 1
+        }
+    fi
+
+    if ! jq -e 'type == "array"' <<<"$MONITOR_JSON" >/dev/null 2>"$errfile"; then
+        log "  btop-monitor: this run's own container list is malformed, not writing containers.json"
+        [[ -s $errfile ]] && log "  btop-monitor: jq said: $(tr '\n' ' ' <"$errfile")"
+        return 1
+    fi
+
+    # old entries whose id is NOT in the new list, plus every new entry
+    merged=$(jq -n -c --argjson old "$old_json" --argjson new "$MONITOR_JSON" '
+        ($new | map(.id)) as $newids
+        | ($old | map(select(([.id] | inside($newids)) | not))) + $new
+    ' 2>"$errfile")
+    if [[ $? -ne 0 || -z $merged ]]; then
+        log "  btop-monitor: merge failed, leaving containers.json untouched"
+        [[ -s $errfile ]] && log "  btop-monitor: jq said: $(tr '\n' ' ' <"$errfile")"
+        return 1
+    fi
+
+    count_old=$(jq 'length' <<<"$old_json" 2>/dev/null); count_old=$(num "$count_old")
+    count_new=$(jq 'length' <<<"$MONITOR_JSON" 2>/dev/null); count_new=$(num "$count_new")
+    count_merged=$(jq 'length' <<<"$merged" 2>/dev/null); count_merged=$(num "$count_merged")
+
+    # the merged list can never be smaller than whichever input had more
+    # entries. If it is, something above is wrong and writing would lose data.
+    if (( count_merged < count_old || count_merged < count_new )); then
+        log "  btop-monitor: merge looks wrong (had $count_old, provisioned $count_new, result $count_merged), refusing to write"
+        return 1
+    fi
+
+    jq -n -c --argjson port "$(num "$BTOP_PORT")" --arg gen "$(date -Is)" --argjson cts "$merged" \
+        '{ttyd_port:$port, generated:$gen, containers:$cts}' >"$existing.tmp" 2>"$errfile" \
+        && mv "$existing.tmp" "$existing" \
+        && log "  btop-monitor: containers.json now has $count_merged host(s) (had $count_old, provisioned $count_new)"
+}
+
 # ------------------------------- guests ------------------------------------
 list_guests() {
     local json
@@ -347,6 +430,36 @@ snapshot_ct() {
     else
         log "  snapshot failed (storage may not support it, or bind mounts are present)"
         T_NOTE="snapshot failed"
+    fi
+}
+
+# A lightweight path used by --monitor-only: no packages, no compose, just
+# btop+ttyd on a running container. Still produces a target so the report
+# and the console read the same way as a normal run.
+monitor_only_guest() {
+    local id=$1 name=$2 state=$3
+
+    log ""
+    log "=== ct $id ($name) === monitor only"
+    reset_target
+    T_OS="(not checked)"
+
+    if [[ $state != running ]]; then
+        log "  container is stopped, cannot install the monitor into it"
+        T_NOTE="stopped"
+        commit_target "$id" lxc "$name" skipped true
+        return
+    fi
+
+    monitor_provision "$id" "$name"
+    T_DONE=true
+    if jq -e --arg id "$id" 'any(.[]; (.id|tostring)==$id)' <<<"$MONITOR_JSON" >/dev/null 2>&1; then
+        log "  btop-monitor: ready"
+        commit_target "$id" lxc "$name" ok
+    else
+        log "  btop-monitor: could not determine the container's IP"
+        T_NOTE="monitor: could not determine IP"
+        commit_target "$id" lxc "$name" warn
     fi
 }
 
@@ -418,7 +531,7 @@ update_guest() {
 }
 
 # ------------------------------- main --------------------------------------
-$UPDATE_HOST && update_host
+$UPDATE_HOST && ! $MONITOR_ONLY && update_host
 
 if $UPDATE_GUESTS; then
     while IFS='|' read -r id name state; do
@@ -434,7 +547,11 @@ if $UPDATE_GUESTS; then
             commit_target "$id" lxc "$name" skipped true
             continue
         fi
-        update_guest "$id" "$name" "$state"
+        if $MONITOR_ONLY; then
+            monitor_only_guest "$id" "$name" "$state"
+        else
+            update_guest "$id" "$name" "$state"
+        fi
     done < <(list_guests)
 fi
 
@@ -499,7 +616,7 @@ log "report: $REPORT_DIR/$RUN_ID.json"
 
 # ------------------------------- notify ------------------------------------
 SUMMARY="node $NODE: $TOT_PKGS packages, $TOT_IMAGES images pulled, $TOT_ERRORS errors, ${DURATION}s"
-if [[ -n $NTFY_URL ]]; then
+if [[ -n $NTFY_URL ]] && ! $MONITOR_ONLY; then
     prio=default; [[ $OVERALL == error ]] && prio=high
     curl -fsS -m 20 \
         ${NTFY_TOKEN:+-H "Authorization: Bearer $NTFY_TOKEN"} \
@@ -507,7 +624,7 @@ if [[ -n $NTFY_URL ]]; then
         -H "Tags: package" -d "$SUMMARY" "$NTFY_URL" >/dev/null 2>&1 \
         || log "ntfy notification failed"
 fi
-if [[ -n $WEBHOOK_URL ]]; then
+if [[ -n $WEBHOOK_URL ]] && ! $MONITOR_ONLY; then
     curl -fsS -m 20 -H 'Content-Type: application/json' \
         -d "$(jq -n --arg t "pve-updater $OVERALL" --arg s "$SUMMARY" \
               --arg r "$RUN_ID" '{title:$t, text:$s, run_id:$r}')" \
@@ -515,11 +632,8 @@ if [[ -n $WEBHOOK_URL ]]; then
 fi
 
 if $BTOP_MONITOR; then
-    jq -n --argjson port "$(num "$BTOP_PORT")" --arg gen "$(date -Is)" \
-          --argjson cts "$MONITOR_JSON" \
-          '{ttyd_port:$port, generated:$gen, containers:$cts}' \
-          >"$WEB_DIR/containers.json" 2>/dev/null \
-        && log "btop-monitor: $(jq 'length' <<<"$MONITOR_JSON") host(s) in containers.json"
+    write_monitor_json
+    log "btop-monitor: $(jq 'length' <<<"$MONITOR_JSON") host(s) provisioned this run"
 fi
 
 cp -f "$LOGFILE" "$WEB_LOG_DIR/$RUN_ID.log"

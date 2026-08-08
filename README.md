@@ -110,6 +110,10 @@ disturbed.
 - **Services** — every service on the node in one searchable table: which container it
   runs in, which stack owns it, which port it answers on. Type `service name` and get
   the answer in one line.
+- **Monitor** — live btop for every container, picked from a list on the left. Only
+  filled in once `BTOP_MONITOR` is on and a run has provisioned btop + ttyd; until then
+  the tab explains how to turn it on. Serve the dashboard over plain HTTP: an HTTPS page
+  cannot frame an HTTP ttyd, and the tab says so rather than showing a blank square.
 - **History** — the last 40 runs, click one to open it.
 - **Settings** — the config file as switches and inputs. Containers to exclude are
   tappable chips built from the live guest list, so you never type an ID. Saving keeps
@@ -119,6 +123,21 @@ disturbed.
   detail panel also has *Update just this one*.
 
 Behind a reverse proxy: forward to the node address on port 8099.
+
+Every tab is addressable: `index.html#monitor`, `#services`, and so on.
+
+### Changing the dashboard
+
+Three files, each with one job:
+
+| file | change it to |
+|---|---|
+| `web/theme.css` | restyle anything. Every colour, radius and component lives here, AMOLED tokens at the top |
+| `web/app.js` | add a tab: write a render function, add one line to `VIEWS` |
+| `web/server.py` | add a setting: one key in `SCHEMA`, then one line in `FIELDS`/`NUMS`/`TEXTS` in `app.js` |
+
+`install.sh` copies every file in `web/` except the backend, so a new stylesheet or page
+needs no installer change.
 
 ### How a run started from the browser is executed
 
